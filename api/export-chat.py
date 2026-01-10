@@ -7,8 +7,7 @@ from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from latex2mathml.converter import convert as latex_to_mathml
-from lxml import etree
+import urllib.request
 
 class handler(BaseHTTPRequestHandler):
     
@@ -118,12 +117,32 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(error_response.encode())
 
     def process_content(self, doc, content):
-        """Обрабатывает контент с формулами, кодом и таблицами"""
+        """Обрабатывает контент с формулами, кодом, таблицами и изображениями"""
         lines = content.split('\n')
         
         i = 0
         while i < len(lines):
             line = lines[i]
+            
+            # Изображения в markdown формате ![alt](url)
+            image_pattern = r'!\[([^\]]*)\]\(([^\)]+)\)'
+            if re.search(image_pattern, line):
+                match = re.search(image_pattern, line)
+                if match:
+                    alt_text = match.group(1)
+                    image_url = match.group(2)
+                    
+                    # Добавляем изображение в документ
+                    try:
+                        self.add_image_from_url(doc, image_url, alt_text)
+                    except Exception as e:
+                        # Если не удалось загрузить - добавляем текст
+                        para = doc.add_paragraph()
+                        run = para.add_run(f'[Изображение: {alt_text}]')
+                        run.italic = True
+                    
+                    i += 1
+                    continue
             
             # Блоки кода ```
             if line.strip().startswith('```'):
@@ -180,6 +199,39 @@ class handler(BaseHTTPRequestHandler):
             
             i += 1
 
+    def add_image_from_url(self, doc, url, alt_text=''):
+        """Скачивает и добавляет изображение в документ"""
+        try:
+            # Скачиваем изображение
+            with urllib.request.urlopen(url, timeout=10) as response:
+                image_data = response.read()
+            
+            # Сохраняем во временный буфер
+            image_stream = io.BytesIO(image_data)
+            
+            # Добавляем в документ
+            para = doc.add_paragraph()
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            # Добавляем изображение с ограничением ширины
+            run = para.add_run()
+            run.add_picture(image_stream, width=Inches(5.0))
+            
+            # Добавляем подпись если есть
+            if alt_text:
+                caption_para = doc.add_paragraph()
+                caption_run = caption_para.add_run(alt_text)
+                caption_run.italic = True
+                caption_run.font.size = Pt(10)
+                caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        except Exception as e:
+            # Если не удалось - добавляем заглушку
+            para = doc.add_paragraph()
+            run = para.add_run(f'[Не удалось загрузить изображение: {alt_text or url}]')
+            run.italic = True
+            run.font.color.rgb = RGBColor(150, 150, 150)
+
     def add_text_with_inline_math(self, doc, text):
         """Добавляет текст с inline LaTeX формулами"""
         inline_pattern = r'\$([^\$]+)\$'
@@ -215,27 +267,20 @@ class handler(BaseHTTPRequestHandler):
 
     def add_math_formula(self, doc, latex, block=True):
         """Добавляет математическую формулу (блочную)"""
-        try:
-            mathml = latex_to_mathml(latex)
-            
-            para = doc.add_paragraph()
-            if block:
-                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            
-            run = para.add_run(f'[Формула: {latex}]')
-            run.italic = True
-            run.font.color.rgb = RGBColor(100, 100, 100)
-            
-        except Exception as e:
-            para = doc.add_paragraph()
-            run = para.add_run(f'[Формула: {latex}]')
-            run.italic = True
+        para = doc.add_paragraph()
+        if block:
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        run = para.add_run(f'{latex}')
+        run.italic = True
+        run.font.size = Pt(12)
+        run.font.color.rgb = RGBColor(60, 60, 60)
 
     def add_inline_math_to_paragraph(self, para, latex):
         """Добавляет inline формулу в параграф"""
-        run = para.add_run(f'[{latex}]')
+        run = para.add_run(f' {latex} ')
         run.italic = True
-        run.font.color.rgb = RGBColor(100, 100, 100)
+        run.font.color.rgb = RGBColor(60, 60, 60)
 
     def add_markdown_table(self, doc, table_lines):
         """Добавляет таблицу из markdown"""
