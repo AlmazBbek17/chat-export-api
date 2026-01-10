@@ -7,6 +7,8 @@ from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from latex2mathml.converter import convert as latex_to_mathml
+from lxml import etree
 import urllib.request
 
 class handler(BaseHTTPRequestHandler):
@@ -267,20 +269,27 @@ class handler(BaseHTTPRequestHandler):
 
     def add_math_formula(self, doc, latex, block=True):
         """Добавляет математическую формулу (блочную)"""
-        para = doc.add_paragraph()
-        if block:
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        run = para.add_run(f'{latex}')
-        run.italic = True
-        run.font.size = Pt(12)
-        run.font.color.rgb = RGBColor(60, 60, 60)
+        try:
+            mathml = latex_to_mathml(latex)
+            
+            para = doc.add_paragraph()
+            if block:
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            run = para.add_run(f'[Формула: {latex}]')
+            run.italic = True
+            run.font.color.rgb = RGBColor(100, 100, 100)
+            
+        except Exception as e:
+            para = doc.add_paragraph()
+            run = para.add_run(f'[Формула: {latex}]')
+            run.italic = True
 
     def add_inline_math_to_paragraph(self, para, latex):
         """Добавляет inline формулу в параграф"""
-        run = para.add_run(f' {latex} ')
+        run = para.add_run(f'[{latex}]')
         run.italic = True
-        run.font.color.rgb = RGBColor(60, 60, 60)
+        run.font.color.rgb = RGBColor(100, 100, 100)
 
     def add_markdown_table(self, doc, table_lines):
         """Добавляет таблицу из markdown"""
