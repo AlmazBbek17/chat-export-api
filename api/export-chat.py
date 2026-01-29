@@ -204,9 +204,21 @@ class handler(BaseHTTPRequestHandler):
     def add_image_from_url(self, doc, url, alt_text=''):
         """Скачивает и добавляет изображение в документ"""
         try:
-            # Скачиваем изображение
-            with urllib.request.urlopen(url, timeout=10) as response:
+            # Добавляем User-Agent чтобы не блокировали
+            req = urllib.request.Request(
+                url,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+            )
+            
+            # Скачиваем изображение с увеличенным таймаутом
+            with urllib.request.urlopen(req, timeout=30) as response:
                 image_data = response.read()
+            
+            # Проверяем что это действительно изображение
+            if len(image_data) < 100:
+                raise Exception('Image too small')
             
             # Сохраняем во временный буфер
             image_stream = io.BytesIO(image_data)
@@ -220,7 +232,7 @@ class handler(BaseHTTPRequestHandler):
             run.add_picture(image_stream, width=Inches(5.0))
             
             # Добавляем подпись если есть
-            if alt_text:
+            if alt_text and alt_text != 'Image':
                 caption_para = doc.add_paragraph()
                 caption_run = caption_para.add_run(alt_text)
                 caption_run.italic = True
@@ -228,11 +240,23 @@ class handler(BaseHTTPRequestHandler):
                 caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         
         except Exception as e:
-            # Если не удалось - добавляем заглушку
+            # Логируем ошибку
+            print(f'Failed to load image {url}: {str(e)}')
+            
+            # Добавляем заглушку с ссылкой
             para = doc.add_paragraph()
-            run = para.add_run(f'[Не удалось загрузить изображение: {alt_text or url}]')
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            run = para.add_run(f'[Не удалось загрузить изображение]')
             run.italic = True
             run.font.color.rgb = RGBColor(150, 150, 150)
+            
+            # Добавляем ссылку на изображение
+            link_para = doc.add_paragraph()
+            link_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            link_run = link_para.add_run(f'Ссылка: {url}')
+            link_run.font.size = Pt(9)
+            link_run.font.color.rgb = RGBColor(0, 0, 255)
 
     def add_text_with_inline_math(self, doc, text):
         """Добавляет текст с inline LaTeX формулами"""
