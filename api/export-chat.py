@@ -126,17 +126,22 @@ class handler(BaseHTTPRequestHandler):
         while i < len(lines):
             line = lines[i]
             
-            # Изображения в markdown формате ![alt](url)
+            # Изображения в markdown формате ![alt](data:image/...)
             image_pattern = r'!\[([^\]]*)\]\(([^\)]+)\)'
             if re.search(image_pattern, line):
                 match = re.search(image_pattern, line)
                 if match:
                     alt_text = match.group(1)
-                    image_url = match.group(2)
+                    image_data = match.group(2)
                     
                     # Добавляем изображение в документ
                     try:
-                        self.add_image_from_url(doc, image_url, alt_text)
+                        if image_data.startswith('data:image'):
+                            # base64 изображение
+                            self.add_image_from_base64(doc, image_data, alt_text)
+                        else:
+                            # URL изображение (fallback)
+                            self.add_image_from_url(doc, image_data, alt_text)
                     except Exception as e:
                         # Если не удалось загрузить - добавляем текст
                         para = doc.add_paragraph()
@@ -200,6 +205,41 @@ class handler(BaseHTTPRequestHandler):
                 doc.add_paragraph()  # Пустая строка
             
             i += 1
+
+    def add_image_from_base64(self, doc, base64_data, alt_text=''):
+        """Добавляет изображение из base64 в документ"""
+        try:
+            import base64
+            
+            # Убираем префикс data:image/...;base64,
+            if 'base64,' in base64_data:
+                base64_data = base64_data.split('base64,')[1]
+            
+            # Декодируем base64
+            image_bytes = base64.b64decode(base64_data)
+            image_stream = io.BytesIO(image_bytes)
+            
+            # Добавляем в документ
+            para = doc.add_paragraph()
+            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            
+            run = para.add_run()
+            run.add_picture(image_stream, width=Inches(5.0))
+            
+            # Добавляем подпись если есть
+            if alt_text and alt_text != 'Image':
+                caption_para = doc.add_paragraph()
+                caption_run = caption_para.add_run(alt_text)
+                caption_run.italic = True
+                caption_run.font.size = Pt(10)
+                caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                
+        except Exception as e:
+            print(f'Failed to load base64 image: {str(e)}')
+            para = doc.add_paragraph()
+            run = para.add_run(f'[Не удалось загрузить изображение: {alt_text}]')
+            run.italic = True
+            run.font.color.rgb = RGBColor(150, 150, 150)
 
     def add_image_from_url(self, doc, url, alt_text=''):
         """Скачивает и добавляет изображение в документ"""
