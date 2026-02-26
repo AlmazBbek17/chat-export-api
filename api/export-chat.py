@@ -11,56 +11,52 @@ from docx.oxml.ns import qn
 from lxml import etree
 import copy
 
-# =============================================
-# OMML builder — строим Word Math XML напрямую
-# =============================================
-
 MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
 W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-
-def M(tag):
-    """Создаёт элемент в math namespace"""
-    return etree.SubElement.__func__  # не используем, ниже вручную
 
 def make_el(ns, tag):
     return etree.Element(f'{{{ns}}}{tag}')
 
 def sub_el(parent, ns, tag):
-    el = etree.SubElement(parent, f'{{{ns}}}{tag}')
-    return el
+    return etree.SubElement(parent, f'{{{ns}}}{tag}')
 
-def make_run(text, italic=True):
-    """Создаёт m:r с текстом"""
+def make_run(text, italic=True, bold=False):
     r = make_el(MATH_NS, 'r')
-    # Свойства шрифта
     rpr = sub_el(r, MATH_NS, 'rPr')
-    sty = sub_el(rpr, MATH_NS, 'sty')
-    sty.set(f'{{{MATH_NS}}}val', 'i' if italic else 'p')
-    # Текст
+    if not italic:
+        sty = sub_el(rpr, MATH_NS, 'sty')
+        sty.set(f'{{{MATH_NS}}}val', 'b' if bold else 'p')
+    else:
+        sty = sub_el(rpr, MATH_NS, 'sty')
+        sty.set(f'{{{MATH_NS}}}val', 'bi' if bold else 'i')
+    # Word run properties for font
+    wrpr = sub_el(r, W_NS, 'rPr')
+    rfonts = sub_el(wrpr, W_NS, 'rFonts')
+    rfonts.set(f'{{{W_NS}}}ascii', 'Cambria Math')
+    rfonts.set(f'{{{W_NS}}}hAnsi', 'Cambria Math')
     t = sub_el(r, MATH_NS, 't')
     t.text = text
     t.set(f'{{{W_NS}}}space', 'preserve')
     return r
 
+def make_text_run(text):
+    """Для \text{} — прямой (не курсивный) текст"""
+    return make_run(text, italic=False, bold=False)
+
 def make_frac(num_elements, den_elements):
-    """Создаёт дробь m:f"""
     f = make_el(MATH_NS, 'f')
-    # fPr
     fpr = sub_el(f, MATH_NS, 'fPr')
     ftype = sub_el(fpr, MATH_NS, 'type')
     ftype.set(f'{{{MATH_NS}}}val', 'bar')
-    # числитель
     num = sub_el(f, MATH_NS, 'num')
     for el in num_elements:
         num.append(el)
-    # знаменатель
     den = sub_el(f, MATH_NS, 'den')
     for el in den_elements:
         den.append(el)
     return f
 
 def make_sup(base_elements, sup_elements):
-    """Верхний индекс m:sSup"""
     ssup = make_el(MATH_NS, 'sSup')
     e = sub_el(ssup, MATH_NS, 'e')
     for el in base_elements:
@@ -70,8 +66,7 @@ def make_sup(base_elements, sup_elements):
         s.append(el)
     return ssup
 
-def make_sub(base_elements, sub_elements):
-    """Нижний индекс m:sSub"""
+def make_sub_el(base_elements, sub_elements):
     ssub = make_el(MATH_NS, 'sSub')
     e = sub_el(ssub, MATH_NS, 'e')
     for el in base_elements:
@@ -81,20 +76,36 @@ def make_sub(base_elements, sub_elements):
         s.append(el)
     return ssub
 
-def make_sqrt(content_elements):
-    """Корень m:rad"""
+def make_subsup(base_elements, sub_elements, sup_elements):
+    """Одновременно нижний и верхний индекс"""
+    ssubsup = make_el(MATH_NS, 'sSubSup')
+    e = sub_el(ssubsup, MATH_NS, 'e')
+    for el in base_elements:
+        e.append(el)
+    sb = sub_el(ssubsup, MATH_NS, 'sub')
+    for el in sub_elements:
+        sb.append(el)
+    sp = sub_el(ssubsup, MATH_NS, 'sup')
+    for el in sup_elements:
+        sp.append(el)
+    return ssubsup
+
+def make_sqrt(content_elements, degree_elements=None):
     rad = make_el(MATH_NS, 'rad')
     radpr = sub_el(rad, MATH_NS, 'radPr')
-    deghide = sub_el(radpr, MATH_NS, 'degHide')
-    deghide.set(f'{{{MATH_NS}}}val', '1')
+    if degree_elements is None:
+        deghide = sub_el(radpr, MATH_NS, 'degHide')
+        deghide.set(f'{{{MATH_NS}}}val', '1')
     deg = sub_el(rad, MATH_NS, 'deg')
+    if degree_elements:
+        for el in degree_elements:
+            deg.append(el)
     e = sub_el(rad, MATH_NS, 'e')
     for el in content_elements:
         e.append(el)
     return rad
 
 def make_accent(base_elements, accent_char='\u0302'):
-    """Акцент (шапочка и т.д.) m:acc"""
     acc = make_el(MATH_NS, 'acc')
     accpr = sub_el(acc, MATH_NS, 'accPr')
     ch = sub_el(accpr, MATH_NS, 'chr')
@@ -105,7 +116,6 @@ def make_accent(base_elements, accent_char='\u0302'):
     return acc
 
 def make_delim(content_elements, beg='(', end=')'):
-    """Скобки m:d"""
     d = make_el(MATH_NS, 'd')
     dpr = sub_el(d, MATH_NS, 'dPr')
     begchr = sub_el(dpr, MATH_NS, 'begChr')
@@ -117,31 +127,84 @@ def make_delim(content_elements, beg='(', end=')'):
         e.append(el)
     return d
 
-# Таблица греческих букв
+def make_func(func_name, arg_elements):
+    """Создаёт функцию типа ln, sin, cos, log"""
+    func = make_el(MATH_NS, 'func')
+    funcpr = sub_el(func, MATH_NS, 'funcPr')
+    fname = sub_el(func, MATH_NS, 'fName')
+    fname.append(make_run(func_name, italic=False))
+    e = sub_el(func, MATH_NS, 'e')
+    for el in arg_elements:
+        e.append(el)
+    return func
+
+def make_nary(symbol, sub_els=None, sup_els=None, content_els=None):
+    """Создаёт большой оператор (сумма, интеграл, произведение)"""
+    nary = make_el(MATH_NS, 'nary')
+    narypr = sub_el(nary, MATH_NS, 'naryPr')
+    ch = sub_el(narypr, MATH_NS, 'chr')
+    ch.set(f'{{{MATH_NS}}}val', symbol)
+    if sub_els is None:
+        subhide = sub_el(narypr, MATH_NS, 'subHide')
+        subhide.set(f'{{{MATH_NS}}}val', '1')
+    if sup_els is None:
+        suphide = sub_el(narypr, MATH_NS, 'supHide')
+        suphide.set(f'{{{MATH_NS}}}val', '1')
+    sb = sub_el(nary, MATH_NS, 'sub')
+    if sub_els:
+        for el in sub_els:
+            sb.append(el)
+    sp = sub_el(nary, MATH_NS, 'sup')
+    if sup_els:
+        for el in sup_els:
+            sp.append(el)
+    e = sub_el(nary, MATH_NS, 'e')
+    if content_els:
+        for el in content_els:
+            e.append(el)
+    return nary
+
+
 GREEK = {
     r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
-    r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
-    r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ',
-    r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ',
-    r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
-    r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
+    r'\epsilon': 'ε', r'\varepsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η',
+    r'\theta': 'θ', r'\vartheta': 'ϑ', r'\iota': 'ι', r'\kappa': 'κ',
+    r'\lambda': 'λ', r'\mu': 'μ', r'\nu': 'ν', r'\xi': 'ξ',
+    r'\pi': 'π', r'\rho': 'ρ', r'\sigma': 'σ', r'\tau': 'τ',
+    r'\upsilon': 'υ', r'\phi': 'φ', r'\varphi': 'φ', r'\chi': 'χ',
+    r'\psi': 'ψ', r'\omega': 'ω',
     r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
-    r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Phi': 'Φ',
-    r'\Psi': 'Ψ', r'\Omega': 'Ω',
-    r'\hbar': 'ℏ', r'\infty': '∞', r'\partial': '∂',
-    r'\nabla': '∇', r'\pm': '±', r'\mp': '∓',
-    r'\times': '×', r'\cdot': '·', r'\leq': '≤', r'\geq': '≥',
-    r'\neq': '≠', r'\approx': '≈', r'\equiv': '≡',
-    r'\sum': '∑', r'\prod': '∏', r'\int': '∫',
-    r'\leftarrow': '←', r'\rightarrow': '→', r'\Rightarrow': '⇒',
-    r'\Leftarrow': '⇐', r'\leftrightarrow': '↔',
+    r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Upsilon': 'Υ',
+    r'\Phi': 'Φ', r'\Psi': 'Ψ', r'\Omega': 'Ω',
 }
 
-def parse_latex_to_omml(latex):
-    """
-    Парсит LaTeX строку и возвращает список OMML элементов.
-    Поддерживает: \frac, ^, _, \hat, \sqrt, \left \right, греческие буквы.
-    """
+SYMBOLS = {
+    r'\hbar': 'ℏ', r'\infty': '∞', r'\partial': '∂',
+    r'\nabla': '∇', r'\pm': '±', r'\mp': '∓',
+    r'\times': '×', r'\cdot': '·', r'\cdots': '⋯', r'\ldots': '…',
+    r'\leq': '≤', r'\geq': '≥', r'\le': '≤', r'\ge': '≥',
+    r'\neq': '≠', r'\ne': '≠', r'\approx': '≈', r'\equiv': '≡',
+    r'\sim': '∼', r'\simeq': '≃', r'\propto': '∝',
+    r'\rightarrow': '→', r'\leftarrow': '←', r'\Rightarrow': '⇒',
+    r'\Leftarrow': '⇐', r'\leftrightarrow': '↔', r'\to': '→',
+    r'\forall': '∀', r'\exists': '∃', r'\in': '∈', r'\notin': '∉',
+    r'\subset': '⊂', r'\supset': '⊃', r'\subseteq': '⊆', r'\supseteq': '⊇',
+    r'\cup': '∪', r'\cap': '∩', r'\emptyset': '∅',
+    r'\circ': '∘', r'\bullet': '•', r'\star': '⋆',
+    r'\prime': '′', r'\angle': '∠', r'\perp': '⊥', r'\parallel': '∥',
+}
+
+FUNCTIONS = {
+    r'\sin', r'\cos', r'\tan', r'\cot', r'\sec', r'\csc',
+    r'\arcsin', r'\arccos', r'\arctan',
+    r'\sinh', r'\cosh', r'\tanh', r'\coth',
+    r'\ln', r'\log', r'\exp', r'\lim', r'\min', r'\max',
+    r'\det', r'\dim', r'\ker', r'\deg',
+    r'\arg', r'\sup', r'\inf', r'\gcd',
+}
+
+
+def parse_latex(latex):
     elements = []
     i = 0
     s = latex.strip()
@@ -149,14 +212,11 @@ def parse_latex_to_omml(latex):
     while i < len(s):
         c = s[i]
         
-        # Пробелы
         if c == ' ':
             i += 1
             continue
         
-        # Группа в {}
         if c == '{':
-            # Находим соответствующую }
             depth = 1
             j = i + 1
             while j < len(s) and depth > 0:
@@ -164,141 +224,205 @@ def parse_latex_to_omml(latex):
                 elif s[j] == '}': depth -= 1
                 j += 1
             inner = s[i+1:j-1]
-            inner_els = parse_latex_to_omml(inner)
-            elements.extend(inner_els)
+            elements.extend(parse_latex(inner))
             i = j
             continue
         
-        # Команды LaTeX
         if c == '\\':
-            # Считываем команду
             j = i + 1
+            if j < len(s) and not s[j].isalpha():
+                # Спецсимволы типа \, \; \! \  и т.д.
+                special = s[i:j+1]
+                if special in (r'\ ', r'\,', r'\;', r'\!', r'\:'):
+                    elements.append(make_run(' ', italic=False))
+                elif special == r'\\':
+                    pass  # line break, skip
+                else:
+                    elements.append(make_run(s[j], italic=False))
+                i = j + 1
+                continue
+            
             while j < len(s) and s[j].isalpha():
                 j += 1
             cmd = s[i:j]
             
-            # \frac{num}{den}
+            # \frac
             if cmd == r'\frac':
-                num_content, after_num = _read_group(s, j)
-                den_content, after_den = _read_group(s, after_num)
-                num_els = parse_latex_to_omml(num_content)
-                den_els = parse_latex_to_omml(den_content)
-                if not num_els: num_els = [make_run(' ')]
-                if not den_els: den_els = [make_run(' ')]
+                num_c, after_n = _read_group(s, j)
+                den_c, after_d = _read_group(s, after_n)
+                num_els = parse_latex(num_c) or [make_run(' ')]
+                den_els = parse_latex(den_c) or [make_run(' ')]
                 elements.append(make_frac(num_els, den_els))
-                i = after_den
+                i = after_d
                 continue
             
-            # \hat{x}
-            if cmd == r'\hat':
+            # \text, \mathrm, \textbf, \textrm
+            if cmd in (r'\text', r'\mathrm', r'\textrm', r'\textbf', r'\operatorname'):
                 content, after = _read_group(s, j)
-                inner_els = parse_latex_to_omml(content)
-                if not inner_els: inner_els = [make_run(' ')]
-                elements.append(make_accent(inner_els, '\u0302'))
+                bold = (cmd == r'\textbf')
+                elements.append(make_run(content, italic=False, bold=bold))
                 i = after
                 continue
             
-            # \vec{x}
-            if cmd == r'\vec':
+            # \hat, \vec, \bar, \tilde, \dot, \ddot
+            accents_map = {
+                r'\hat': '\u0302', r'\vec': '\u20D7', r'\bar': '\u0305',
+                r'\tilde': '\u0303', r'\dot': '\u0307', r'\ddot': '\u0308',
+                r'\overline': '\u0305', r'\underline': '\u0332',
+                r'\widehat': '\u0302', r'\widetilde': '\u0303',
+            }
+            if cmd in accents_map:
                 content, after = _read_group(s, j)
-                inner_els = parse_latex_to_omml(content)
-                if not inner_els: inner_els = [make_run(' ')]
-                elements.append(make_accent(inner_els, '\u20D7'))
+                inner_els = parse_latex(content) or [make_run(' ')]
+                elements.append(make_accent(inner_els, accents_map[cmd]))
                 i = after
                 continue
             
-            # \bar{x}
-            if cmd == r'\bar':
-                content, after = _read_group(s, j)
-                inner_els = parse_latex_to_omml(content)
-                if not inner_els: inner_els = [make_run(' ')]
-                elements.append(make_accent(inner_els, '\u0305'))
-                i = after
-                continue
-            
-            # \sqrt{x}
+            # \sqrt
             if cmd == r'\sqrt':
-                content, after = _read_group(s, j)
-                inner_els = parse_latex_to_omml(content)
-                if not inner_els: inner_els = [make_run(' ')]
-                elements.append(make_sqrt(inner_els))
+                # Проверяем необязательный аргумент [n]
+                deg_els = None
+                pos = j
+                while pos < len(s) and s[pos] == ' ':
+                    pos += 1
+                if pos < len(s) and s[pos] == '[':
+                    end_bracket = s.find(']', pos)
+                    if end_bracket > 0:
+                        deg_content = s[pos+1:end_bracket]
+                        deg_els = parse_latex(deg_content)
+                        pos = end_bracket + 1
+                content, after = _read_group(s, pos)
+                inner_els = parse_latex(content) or [make_run(' ')]
+                elements.append(make_sqrt(inner_els, deg_els))
                 i = after
                 continue
             
-            # \left( ... \right)
+            # \left \right
             if cmd == r'\left':
                 beg_char = s[j] if j < len(s) else '('
-                # Ищем \right
-                right_pos = s.find(r'\right', j+1)
+                if beg_char == '.': beg_char = ''
+                right_pos = _find_matching_right(s, j+1)
                 if right_pos >= 0:
                     inner = s[j+1:right_pos]
-                    end_pos = right_pos + 6
+                    end_pos = right_pos + 6  # len(\right)
                     end_char = s[end_pos] if end_pos < len(s) else ')'
-                    inner_els = parse_latex_to_omml(inner)
-                    if not inner_els: inner_els = [make_run(' ')]
-                    elements.append(make_delim(inner_els, beg_char, end_char))
+                    if end_char == '.': end_char = ''
+                    inner_els = parse_latex(inner) or [make_run(' ')]
+                    elements.append(make_delim(inner_els, beg_char or '(', end_char or ')'))
                     i = end_pos + 1
                 else:
-                    elements.append(make_run(beg_char))
+                    elements.append(make_run(beg_char, italic=False))
                     i = j + 1
                 continue
             
-            # \right — обрабатывается в \left
             if cmd == r'\right':
                 i = j + 1
                 continue
             
-            # Греческие и спец символы
-            if cmd in GREEK:
-                elements.append(make_run(GREEK[cmd], italic=False))
+            # Функции (sin, cos, ln, log, lim, etc)
+            if cmd in FUNCTIONS:
+                func_name = cmd[1:]  # убираем \
+                # Проверяем есть ли аргумент в скобках или {}
+                pos = j
+                while pos < len(s) and s[pos] == ' ':
+                    pos += 1
+                # Просто вставляем как не-курсивный текст
+                elements.append(make_run(func_name, italic=False))
                 i = j
                 continue
             
-            # Неизвестная команда — выводим как текст
-            elements.append(make_run(cmd[1:]))
+            # \sum, \prod, \int с пределами
+            nary_map = {r'\sum': '∑', r'\prod': '∏', r'\int': '∫',
+                        r'\iint': '∬', r'\iiint': '∭', r'\oint': '∮'}
+            if cmd in nary_map:
+                elements.append(make_run(nary_map[cmd], italic=False))
+                i = j
+                continue
+            
+            # Греческие буквы
+            if cmd in GREEK:
+                elements.append(make_run(GREEK[cmd], italic=True))
+                i = j
+                continue
+            
+            # Символы
+            if cmd in SYMBOLS:
+                elements.append(make_run(SYMBOLS[cmd], italic=False))
+                i = j
+                continue
+            
+            # \mathbf, \mathbb, \mathcal
+            if cmd in (r'\mathbf', r'\mathbb', r'\mathcal', r'\boldsymbol'):
+                content, after = _read_group(s, j)
+                is_bold = cmd in (r'\mathbf', r'\boldsymbol')
+                elements.append(make_run(content, italic=False, bold=is_bold))
+                i = after
+                continue
+            
+            # Неизвестная команда
+            elements.append(make_run(cmd[1:], italic=False))
             i = j
             continue
         
-        # Верхний индекс ^
+        # ^ верхний индекс
         if c == '^':
-            sup_content, after = _read_group_or_char(s, i+1)
-            sup_els = parse_latex_to_omml(sup_content)
-            if not sup_els: sup_els = [make_run(' ')]
-            
-            # Берём последний элемент как базу
+            sup_c, after = _read_group_or_char(s, i+1)
+            sup_els = parse_latex(sup_c) or [make_run(' ')]
             if elements:
                 base = elements.pop()
-                elements.append(make_sup([base], sup_els))
+                # Проверяем: если дальше идёт _, то это subsup
+                if after < len(s) and s[after] == '_':
+                    sub_c, after2 = _read_group_or_char(s, after+1)
+                    sub_els2 = parse_latex(sub_c) or [make_run(' ')]
+                    elements.append(make_subsup([base], sub_els2, sup_els))
+                    i = after2
+                else:
+                    elements.append(make_sup([base], sup_els))
+                    i = after
             else:
                 elements.append(make_sup([make_run(' ')], sup_els))
-            i = after
+                i = after
             continue
         
-        # Нижний индекс _
+        # _ нижний индекс
         if c == '_':
-            sub_content, after = _read_group_or_char(s, i+1)
-            sub_els = parse_latex_to_omml(sub_content)
-            if not sub_els: sub_els = [make_run(' ')]
-            
+            sub_c, after = _read_group_or_char(s, i+1)
+            sub_els = parse_latex(sub_c) or [make_run(' ')]
             if elements:
                 base = elements.pop()
-                elements.append(make_sub([base], sub_els))
+                # Проверяем: если дальше идёт ^, то это subsup
+                if after < len(s) and s[after] == '^':
+                    sup_c2, after2 = _read_group_or_char(s, after+1)
+                    sup_els2 = parse_latex(sup_c2) or [make_run(' ')]
+                    elements.append(make_subsup([base], sub_els, sup_els2))
+                    i = after2
+                else:
+                    elements.append(make_sub_el([base], sub_els))
+                    i = after
             else:
-                elements.append(make_sub([make_run(' ')], sub_els))
-            i = after
+                elements.append(make_sub_el([make_run(' ')], sub_els))
+                i = after
             continue
         
-        # Обычные символы — группируем текст
+        # Обычные символы
         text = ''
-        while i < len(s) and s[i] not in '\\{}^_$ ':
-            if s[i] in '+-=()[]|<>,.:;!?':
+        while i < len(s) and s[i] not in '\\{}^_$ \t':
+            ch = s[i]
+            if ch in '+-=<>':
                 if text:
                     elements.append(make_run(text))
                     text = ''
-                elements.append(make_run(s[i], italic=False))
+                elements.append(make_run(ch, italic=False))
                 i += 1
                 continue
-            text += s[i]
+            if ch in '(),.:;!?[]|/':
+                if text:
+                    elements.append(make_run(text))
+                    text = ''
+                elements.append(make_run(ch, italic=False))
+                i += 1
+                continue
+            text += ch
             i += 1
         if text:
             elements.append(make_run(text))
@@ -307,15 +431,29 @@ def parse_latex_to_omml(latex):
     return elements
 
 
+def _find_matching_right(s, start):
+    """Ищет \right соответствующую \left"""
+    depth = 1
+    i = start
+    while i < len(s) - 5:
+        if s[i:i+5] == r'\left':
+            depth += 1
+            i += 5
+        elif s[i:i+6] == r'\right':
+            depth -= 1
+            if depth == 0:
+                return i
+            i += 6
+        else:
+            i += 1
+    return -1
+
+
 def _read_group(s, pos):
-    """Читает {content} начиная с pos. Возвращает (content, pos_after)"""
-    # Пропускаем пробелы
     while pos < len(s) and s[pos] == ' ':
         pos += 1
-    
     if pos >= len(s):
         return ('', pos)
-    
     if s[pos] == '{':
         depth = 1
         j = pos + 1
@@ -325,12 +463,10 @@ def _read_group(s, pos):
             j += 1
         return (s[pos+1:j-1], j)
     else:
-        # Один символ
         return (s[pos], pos+1)
 
 
 def _read_group_or_char(s, pos):
-    """Читает {content} или один символ"""
     while pos < len(s) and s[pos] == ' ':
         pos += 1
     if pos >= len(s):
@@ -338,7 +474,6 @@ def _read_group_or_char(s, pos):
     if s[pos] == '{':
         return _read_group(s, pos)
     elif s[pos] == '\\':
-        # Команда
         j = pos + 1
         while j < len(s) and s[j].isalpha():
             j += 1
@@ -348,16 +483,14 @@ def _read_group_or_char(s, pos):
 
 
 def build_omath(latex):
-    """Строит полный m:oMath элемент из LaTeX"""
     omath = make_el(MATH_NS, 'oMath')
-    elements = parse_latex_to_omml(latex)
+    elements = parse_latex(latex)
     for el in elements:
         omath.append(el)
     return omath
 
 
 def insert_math(paragraph, latex):
-    """Вставляет формулу в параграф"""
     try:
         omath = build_omath(latex)
         paragraph._element.append(omath)
@@ -372,7 +505,6 @@ def insert_math(paragraph, latex):
 
 
 def add_block_formula(doc, latex):
-    """Блочная формула"""
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     insert_math(p, latex)
@@ -402,18 +534,34 @@ class handler(BaseHTTPRequestHandler):
         self.end_headers()
         
         test = 'not tested'
+        tests = {}
         try:
+            # Тест 1: простая дробь
             omath = build_omath(r'\frac{a}{b}')
-            tag = etree.QName(omath.tag).localname
-            children = len(list(omath))
-            test = f'OK (tag={tag}, children={children})'
+            tests['frac'] = f'OK ({len(list(omath))} children)'
+            
+            # Тест 2: text
+            omath2 = build_omath(r'V = \text{const}')
+            tests['text'] = f'OK ({len(list(omath2))} children)'
+            
+            # Тест 3: греческие + Delta
+            omath3 = build_omath(r'A = P\Delta V')
+            tests['greek'] = f'OK ({len(list(omath3))} children)'
+            
+            # Тест 4: ln
+            omath4 = build_omath(r'\nu RT \ln(V_2/V_1)')
+            tests['ln'] = f'OK ({len(list(omath4))} children)'
+            
+            test = 'ALL OK'
         except Exception as e:
             test = f'Error: {str(e)}'
+            traceback.print_exc()
         
         r = json.dumps({
             'status': 'OK',
-            'version': '4.0-direct-omml',
-            'math_test': test
+            'version': '5.0-full-parser',
+            'math_test': test,
+            'tests': tests
         })
         self.wfile.write(r.encode())
 
@@ -437,7 +585,6 @@ class handler(BaseHTTPRequestHandler):
             
             h = doc.add_heading(title, level=1)
             h.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            
             dp = doc.add_paragraph()
             dr = dp.add_run(self._date())
             dr.font.size = Pt(10)
@@ -478,7 +625,7 @@ class handler(BaseHTTPRequestHandler):
             self._cors()
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({'error': str(e)}).encode())
+            self.wfile.write(json.dumps({'error': str(e), 'trace': traceback.format_exc()}).encode())
 
     def _process(self, doc, content):
         lines = content.split('\n')
@@ -502,14 +649,15 @@ class handler(BaseHTTPRequestHandler):
                 i += 1
                 continue
             
+            # Таблицы
             if '|' in line and line.strip().startswith('|'):
                 tlines = []
                 while i < len(lines) and '|' in lines[i]:
-                    if '---' not in lines[i]:
+                    if not re.match(r'^\s*\|[\s\-:|]+\|\s*$', lines[i]):
                         tlines.append(lines[i])
                     i += 1
                 if tlines:
-                    self._table(doc, tlines)
+                    self._table_with_math(doc, tlines)
                 continue
             
             bm = re.match(r'^\s*\$\$(.+?)\$\$\s*$', line)
@@ -549,6 +697,53 @@ class handler(BaseHTTPRequestHandler):
                     self._fmt(p, part)
             else:
                 insert_math(p, part.strip())
+
+    def _add_cell_content_with_math(self, cell, text):
+        """Добавляет текст с формулами в ячейку таблицы"""
+        text = text.strip()
+        parts = re.split(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', text)
+        
+        para = cell.paragraphs[0]
+        
+        if len(parts) <= 1:
+            # Нет формул
+            run = para.add_run(text)
+            run.font.size = Pt(11)
+            return
+        
+        for idx, part in enumerate(parts):
+            if idx % 2 == 0:
+                if part.strip():
+                    run = para.add_run(part)
+                    run.font.size = Pt(11)
+            else:
+                insert_math(para, part.strip())
+
+    def _table_with_math(self, doc, tlines):
+        """Таблица с поддержкой формул в ячейках"""
+        rows = []
+        for l in tlines:
+            cells = [c.strip() for c in l.split('|')]
+            cells = [c for c in cells if c != '']
+            if cells:
+                rows.append(cells)
+        if not rows:
+            return
+        mc = max(len(r) for r in rows)
+        t = doc.add_table(rows=len(rows), cols=mc)
+        t.style = 'Table Grid'
+        for i, rd in enumerate(rows):
+            for j, ct in enumerate(rd):
+                if j < mc:
+                    cell = t.rows[i].cells[j]
+                    if '$' in ct:
+                        self._add_cell_content_with_math(cell, ct)
+                    else:
+                        run = cell.paragraphs[0].add_run(ct)
+                        run.font.size = Pt(11)
+                    if i == 0:
+                        for run in cell.paragraphs[0].runs:
+                            run.bold = True
 
     def _fmt(self, para, text):
         bparts = re.split(r'\*\*(.+?)\*\*', text)
@@ -591,22 +786,6 @@ class handler(BaseHTTPRequestHandler):
             p = doc.add_paragraph()
             r = p.add_run(f'[Image: {alt}]')
             r.italic = True
-
-    def _table(self, doc, tlines):
-        rows = []
-        for l in tlines:
-            cells = [c.strip() for c in l.split('|') if c.strip()]
-            if cells: rows.append(cells)
-        if not rows: return
-        mc = max(len(r) for r in rows)
-        t = doc.add_table(rows=len(rows), cols=mc)
-        t.style = 'Table Grid'
-        for i, rd in enumerate(rows):
-            for j, ct in enumerate(rd):
-                if j < mc:
-                    r = t.rows[i].cells[j].paragraphs[0].add_run(ct)
-                    r.font.size = Pt(11)
-                    if i == 0: r.bold = True
 
     def _date(self):
         from datetime import datetime
