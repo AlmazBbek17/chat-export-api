@@ -7,365 +7,607 @@ from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
-from docx.oxml.ns import qn, nsmap
+from docx.oxml.ns import qn
 from lxml import etree
-import urllib.request
+import copy
 
 # =============================================
-# LaTeX → OMML (нативные формулы Word)
+# OMML builder — строим Word Math XML напрямую
 # =============================================
 
-# Word namespace для математики
-WORD_MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
 
-# Кешируем XSLT
-_XSLT_TRANSFORM = None
+def M(tag):
+    """Создаёт элемент в math namespace"""
+    return etree.SubElement.__func__  # не используем, ниже вручную
 
-def get_xslt_transform():
-    """Загружает и кеширует XSLT для MathML→OMML"""
-    global _XSLT_TRANSFORM
-    if _XSLT_TRANSFORM is not None:
-        return _XSLT_TRANSFORM
+def make_el(ns, tag):
+    return etree.Element(f'{{{ns}}}{tag}')
+
+def sub_el(parent, ns, tag):
+    el = etree.SubElement(parent, f'{{{ns}}}{tag}')
+    return el
+
+def make_run(text, italic=True):
+    """Создаёт m:r с текстом"""
+    r = make_el(MATH_NS, 'r')
+    # Свойства шрифта
+    rpr = sub_el(r, MATH_NS, 'rPr')
+    sty = sub_el(rpr, MATH_NS, 'sty')
+    sty.set(f'{{{MATH_NS}}}val', 'i' if italic else 'p')
+    # Текст
+    t = sub_el(r, MATH_NS, 't')
+    t.text = text
+    t.set(f'{{{W_NS}}}space', 'preserve')
+    return r
+
+def make_frac(num_elements, den_elements):
+    """Создаёт дробь m:f"""
+    f = make_el(MATH_NS, 'f')
+    # fPr
+    fpr = sub_el(f, MATH_NS, 'fPr')
+    ftype = sub_el(fpr, MATH_NS, 'type')
+    ftype.set(f'{{{MATH_NS}}}val', 'bar')
+    # числитель
+    num = sub_el(f, MATH_NS, 'num')
+    for el in num_elements:
+        num.append(el)
+    # знаменатель
+    den = sub_el(f, MATH_NS, 'den')
+    for el in den_elements:
+        den.append(el)
+    return f
+
+def make_sup(base_elements, sup_elements):
+    """Верхний индекс m:sSup"""
+    ssup = make_el(MATH_NS, 'sSup')
+    e = sub_el(ssup, MATH_NS, 'e')
+    for el in base_elements:
+        e.append(el)
+    s = sub_el(ssup, MATH_NS, 'sup')
+    for el in sup_elements:
+        s.append(el)
+    return ssup
+
+def make_sub(base_elements, sub_elements):
+    """Нижний индекс m:sSub"""
+    ssub = make_el(MATH_NS, 'sSub')
+    e = sub_el(ssub, MATH_NS, 'e')
+    for el in base_elements:
+        e.append(el)
+    s = sub_el(ssub, MATH_NS, 'sub')
+    for el in sub_elements:
+        s.append(el)
+    return ssub
+
+def make_sqrt(content_elements):
+    """Корень m:rad"""
+    rad = make_el(MATH_NS, 'rad')
+    radpr = sub_el(rad, MATH_NS, 'radPr')
+    deghide = sub_el(radpr, MATH_NS, 'degHide')
+    deghide.set(f'{{{MATH_NS}}}val', '1')
+    deg = sub_el(rad, MATH_NS, 'deg')
+    e = sub_el(rad, MATH_NS, 'e')
+    for el in content_elements:
+        e.append(el)
+    return rad
+
+def make_accent(base_elements, accent_char='\u0302'):
+    """Акцент (шапочка и т.д.) m:acc"""
+    acc = make_el(MATH_NS, 'acc')
+    accpr = sub_el(acc, MATH_NS, 'accPr')
+    ch = sub_el(accpr, MATH_NS, 'chr')
+    ch.set(f'{{{MATH_NS}}}val', accent_char)
+    e = sub_el(acc, MATH_NS, 'e')
+    for el in base_elements:
+        e.append(el)
+    return acc
+
+def make_delim(content_elements, beg='(', end=')'):
+    """Скобки m:d"""
+    d = make_el(MATH_NS, 'd')
+    dpr = sub_el(d, MATH_NS, 'dPr')
+    begchr = sub_el(dpr, MATH_NS, 'begChr')
+    begchr.set(f'{{{MATH_NS}}}val', beg)
+    endchr = sub_el(dpr, MATH_NS, 'endChr')
+    endchr.set(f'{{{MATH_NS}}}val', end)
+    e = sub_el(d, MATH_NS, 'e')
+    for el in content_elements:
+        e.append(el)
+    return d
+
+# Таблица греческих букв
+GREEK = {
+    r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+    r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
+    r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ',
+    r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ',
+    r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
+    r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
+    r'\Gamma': 'Γ', r'\Delta': 'Δ', r'\Theta': 'Θ', r'\Lambda': 'Λ',
+    r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Sigma': 'Σ', r'\Phi': 'Φ',
+    r'\Psi': 'Ψ', r'\Omega': 'Ω',
+    r'\hbar': 'ℏ', r'\infty': '∞', r'\partial': '∂',
+    r'\nabla': '∇', r'\pm': '±', r'\mp': '∓',
+    r'\times': '×', r'\cdot': '·', r'\leq': '≤', r'\geq': '≥',
+    r'\neq': '≠', r'\approx': '≈', r'\equiv': '≡',
+    r'\sum': '∑', r'\prod': '∏', r'\int': '∫',
+    r'\leftarrow': '←', r'\rightarrow': '→', r'\Rightarrow': '⇒',
+    r'\Leftarrow': '⇐', r'\leftrightarrow': '↔',
+}
+
+def parse_latex_to_omml(latex):
+    """
+    Парсит LaTeX строку и возвращает список OMML элементов.
+    Поддерживает: \frac, ^, _, \hat, \sqrt, \left \right, греческие буквы.
+    """
+    elements = []
+    i = 0
+    s = latex.strip()
     
-    # Список зеркал для скачивания MML2OMML.XSL
-    xslt_urls = [
-        'https://raw.githubusercontent.com/nicjohnson145/planern/master/planern/MML2OMML.XSL',
-        'https://raw.githubusercontent.com/oerpub/mathconverter/master/MML2OMML.XSL',
-        'https://raw.githubusercontent.com/pjheslin/diogenes/master/server/MML2OMML.XSL',
-    ]
-    
-    for url in xslt_urls:
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as response:
-                xslt_content = response.read()
-            xslt_tree = etree.fromstring(xslt_content)
-            _XSLT_TRANSFORM = etree.XSLT(xslt_tree)
-            print(f'XSLT loaded successfully from {url}')
-            return _XSLT_TRANSFORM
-        except Exception as e:
-            print(f'Failed to load XSLT from {url}: {e}')
+    while i < len(s):
+        c = s[i]
+        
+        # Пробелы
+        if c == ' ':
+            i += 1
             continue
+        
+        # Группа в {}
+        if c == '{':
+            # Находим соответствующую }
+            depth = 1
+            j = i + 1
+            while j < len(s) and depth > 0:
+                if s[j] == '{': depth += 1
+                elif s[j] == '}': depth -= 1
+                j += 1
+            inner = s[i+1:j-1]
+            inner_els = parse_latex_to_omml(inner)
+            elements.extend(inner_els)
+            i = j
+            continue
+        
+        # Команды LaTeX
+        if c == '\\':
+            # Считываем команду
+            j = i + 1
+            while j < len(s) and s[j].isalpha():
+                j += 1
+            cmd = s[i:j]
+            
+            # \frac{num}{den}
+            if cmd == r'\frac':
+                num_content, after_num = _read_group(s, j)
+                den_content, after_den = _read_group(s, after_num)
+                num_els = parse_latex_to_omml(num_content)
+                den_els = parse_latex_to_omml(den_content)
+                if not num_els: num_els = [make_run(' ')]
+                if not den_els: den_els = [make_run(' ')]
+                elements.append(make_frac(num_els, den_els))
+                i = after_den
+                continue
+            
+            # \hat{x}
+            if cmd == r'\hat':
+                content, after = _read_group(s, j)
+                inner_els = parse_latex_to_omml(content)
+                if not inner_els: inner_els = [make_run(' ')]
+                elements.append(make_accent(inner_els, '\u0302'))
+                i = after
+                continue
+            
+            # \vec{x}
+            if cmd == r'\vec':
+                content, after = _read_group(s, j)
+                inner_els = parse_latex_to_omml(content)
+                if not inner_els: inner_els = [make_run(' ')]
+                elements.append(make_accent(inner_els, '\u20D7'))
+                i = after
+                continue
+            
+            # \bar{x}
+            if cmd == r'\bar':
+                content, after = _read_group(s, j)
+                inner_els = parse_latex_to_omml(content)
+                if not inner_els: inner_els = [make_run(' ')]
+                elements.append(make_accent(inner_els, '\u0305'))
+                i = after
+                continue
+            
+            # \sqrt{x}
+            if cmd == r'\sqrt':
+                content, after = _read_group(s, j)
+                inner_els = parse_latex_to_omml(content)
+                if not inner_els: inner_els = [make_run(' ')]
+                elements.append(make_sqrt(inner_els))
+                i = after
+                continue
+            
+            # \left( ... \right)
+            if cmd == r'\left':
+                beg_char = s[j] if j < len(s) else '('
+                # Ищем \right
+                right_pos = s.find(r'\right', j+1)
+                if right_pos >= 0:
+                    inner = s[j+1:right_pos]
+                    end_pos = right_pos + 6
+                    end_char = s[end_pos] if end_pos < len(s) else ')'
+                    inner_els = parse_latex_to_omml(inner)
+                    if not inner_els: inner_els = [make_run(' ')]
+                    elements.append(make_delim(inner_els, beg_char, end_char))
+                    i = end_pos + 1
+                else:
+                    elements.append(make_run(beg_char))
+                    i = j + 1
+                continue
+            
+            # \right — обрабатывается в \left
+            if cmd == r'\right':
+                i = j + 1
+                continue
+            
+            # Греческие и спец символы
+            if cmd in GREEK:
+                elements.append(make_run(GREEK[cmd], italic=False))
+                i = j
+                continue
+            
+            # Неизвестная команда — выводим как текст
+            elements.append(make_run(cmd[1:]))
+            i = j
+            continue
+        
+        # Верхний индекс ^
+        if c == '^':
+            sup_content, after = _read_group_or_char(s, i+1)
+            sup_els = parse_latex_to_omml(sup_content)
+            if not sup_els: sup_els = [make_run(' ')]
+            
+            # Берём последний элемент как базу
+            if elements:
+                base = elements.pop()
+                elements.append(make_sup([base], sup_els))
+            else:
+                elements.append(make_sup([make_run(' ')], sup_els))
+            i = after
+            continue
+        
+        # Нижний индекс _
+        if c == '_':
+            sub_content, after = _read_group_or_char(s, i+1)
+            sub_els = parse_latex_to_omml(sub_content)
+            if not sub_els: sub_els = [make_run(' ')]
+            
+            if elements:
+                base = elements.pop()
+                elements.append(make_sub([base], sub_els))
+            else:
+                elements.append(make_sub([make_run(' ')], sub_els))
+            i = after
+            continue
+        
+        # Обычные символы — группируем текст
+        text = ''
+        while i < len(s) and s[i] not in '\\{}^_$ ':
+            if s[i] in '+-=()[]|<>,.:;!?':
+                if text:
+                    elements.append(make_run(text))
+                    text = ''
+                elements.append(make_run(s[i], italic=False))
+                i += 1
+                continue
+            text += s[i]
+            i += 1
+        if text:
+            elements.append(make_run(text))
+        continue
     
-    print('All XSLT sources failed')
-    return None
+    return elements
 
 
-def latex_to_omml(latex_str):
-    """LaTeX → MathML → OMML"""
+def _read_group(s, pos):
+    """Читает {content} начиная с pos. Возвращает (content, pos_after)"""
+    # Пропускаем пробелы
+    while pos < len(s) and s[pos] == ' ':
+        pos += 1
+    
+    if pos >= len(s):
+        return ('', pos)
+    
+    if s[pos] == '{':
+        depth = 1
+        j = pos + 1
+        while j < len(s) and depth > 0:
+            if s[j] == '{': depth += 1
+            elif s[j] == '}': depth -= 1
+            j += 1
+        return (s[pos+1:j-1], j)
+    else:
+        # Один символ
+        return (s[pos], pos+1)
+
+
+def _read_group_or_char(s, pos):
+    """Читает {content} или один символ"""
+    while pos < len(s) and s[pos] == ' ':
+        pos += 1
+    if pos >= len(s):
+        return ('', pos)
+    if s[pos] == '{':
+        return _read_group(s, pos)
+    elif s[pos] == '\\':
+        # Команда
+        j = pos + 1
+        while j < len(s) and s[j].isalpha():
+            j += 1
+        return (s[pos:j], j)
+    else:
+        return (s[pos], pos+1)
+
+
+def build_omath(latex):
+    """Строит полный m:oMath элемент из LaTeX"""
+    omath = make_el(MATH_NS, 'oMath')
+    elements = parse_latex_to_omml(latex)
+    for el in elements:
+        omath.append(el)
+    return omath
+
+
+def insert_math(paragraph, latex):
+    """Вставляет формулу в параграф"""
     try:
-        from latex2mathml.converter import convert as latex_to_mathml
-        
-        # LaTeX → MathML
-        mathml_str = latex_to_mathml(latex_str)
-        
-        # MathML → OMML
-        xslt = get_xslt_transform()
-        if xslt is None:
-            return None
-        
-        mathml_tree = etree.fromstring(mathml_str.encode('utf-8'))
-        omml_tree = xslt(mathml_tree)
-        omml_root = omml_tree.getroot()
-        
-        return omml_root
+        omath = build_omath(latex)
+        paragraph._element.append(omath)
+        return True
     except Exception as e:
-        print(f'LaTeX→OMML failed for "{latex_str}": {e}')
-        return None
+        print(f'Math error "{latex}": {e}')
+        traceback.print_exc()
+        r = paragraph.add_run(latex)
+        r.font.name = 'Cambria Math'
+        r.italic = True
+        return False
 
 
-def add_math_to_paragraph(para, latex_str):
-    """Добавляет формулу в параграф. Возвращает True если успешно."""
-    omml = latex_to_omml(latex_str)
-    if omml is not None:
-        try:
-            para._element.append(omml)
-            return True
-        except:
-            pass
-    
-    # Fallback: красивый текст формулы
-    run = para.add_run(latex_str)
-    run.font.name = 'Cambria Math'
-    run.font.size = Pt(12)
-    run.italic = True
-    return False
+def add_block_formula(doc, latex):
+    """Блочная формула"""
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    insert_math(p, latex)
 
+
+# =============================================
+# HTTP Handler
+# =============================================
 
 class handler(BaseHTTPRequestHandler):
     
-    def _set_cors_headers(self):
+    def _cors(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS, GET')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Access-Control-Max-Age', '3600')
     
     def do_OPTIONS(self):
         self.send_response(200)
-        self._set_cors_headers()
+        self._cors()
         self.end_headers()
 
     def do_GET(self):
         self.send_response(200)
-        self._set_cors_headers()
+        self._cors()
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
         
-        # Тестируем конвертацию при GET запросе
-        test_result = 'not tested'
+        test = 'not tested'
         try:
-            omml = latex_to_omml(r'\frac{a}{b}')
-            test_result = 'OK' if omml is not None else 'XSLT failed'
+            omath = build_omath(r'\frac{a}{b}')
+            tag = etree.QName(omath.tag).localname
+            children = len(list(omath))
+            test = f'OK (tag={tag}, children={children})'
         except Exception as e:
-            test_result = f'Error: {str(e)}'
+            test = f'Error: {str(e)}'
         
-        response = json.dumps({
+        r = json.dumps({
             'status': 'OK',
-            'message': 'Gemini Chat Export API v2 - OMML Math',
-            'math_test': test_result
+            'version': '4.0-direct-omml',
+            'math_test': test
         })
-        self.wfile.write(response.encode())
+        self.wfile.write(r.encode())
 
     def do_POST(self):
         try:
-            content_length = int(self.headers.get('Content-Length', 0))
-            post_data = self.rfile.read(content_length)
-            data = json.loads(post_data.decode('utf-8'))
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length).decode('utf-8'))
             
             messages = data.get('messages', [])
             title = data.get('title', 'Gemini Chat')
             
             if not messages:
                 self.send_response(400)
-                self._set_cors_headers()
+                self._cors()
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                self.wfile.write(json.dumps({'error': 'No messages'}).encode())
+                self.wfile.write(b'{"error":"No messages"}')
                 return
             
             doc = Document()
             
-            # Заголовок
-            heading = doc.add_heading(title, level=1)
-            heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            h = doc.add_heading(title, level=1)
+            h.alignment = WD_ALIGN_PARAGRAPH.CENTER
             
-            date_para = doc.add_paragraph()
-            date_run = date_para.add_run(self._get_date())
-            date_run.font.size = Pt(10)
-            date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            dp = doc.add_paragraph()
+            dr = dp.add_run(self._date())
+            dr.font.size = Pt(10)
+            dp.alignment = WD_ALIGN_PARAGRAPH.CENTER
             doc.add_paragraph()
             
             for i, msg in enumerate(messages):
                 role = msg.get('role', 'user')
                 content = msg.get('content', '')
                 
-                # Роль
-                role_para = doc.add_paragraph()
-                role_run = role_para.add_run('You' if role == 'user' else 'Gemini')
-                role_run.bold = True
-                role_run.font.size = Pt(14)
-                role_run.font.color.rgb = RGBColor(33, 150, 243) if role == 'user' else RGBColor(76, 175, 80)
+                rp = doc.add_paragraph()
+                rr = rp.add_run('You' if role == 'user' else 'Gemini')
+                rr.bold = True
+                rr.font.size = Pt(14)
+                rr.font.color.rgb = RGBColor(33, 150, 243) if role == 'user' else RGBColor(76, 175, 80)
                 
-                # Контент
-                self._process_content(doc, content)
+                self._process(doc, content)
                 
-                # Разделитель
                 if i < len(messages) - 1:
-                    sep = doc.add_paragraph()
-                    sep_run = sep.add_run('─' * 60)
-                    sep_run.font.color.rgb = RGBColor(200, 200, 200)
+                    sp = doc.add_paragraph()
+                    sr = sp.add_run('─' * 60)
+                    sr.font.color.rgb = RGBColor(200, 200, 200)
             
-            buffer = io.BytesIO()
-            doc.save(buffer)
-            buffer.seek(0)
+            buf = io.BytesIO()
+            doc.save(buf)
+            buf.seek(0)
             
             self.send_response(200)
-            self._set_cors_headers()
+            self._cors()
             self.send_header('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-            self.send_header('Content-Disposition', f'attachment; filename="gemini-chat.docx"')
+            self.send_header('Content-Disposition', 'attachment; filename="gemini-chat.docx"')
             self.end_headers()
-            self.wfile.write(buffer.getvalue())
+            self.wfile.write(buf.getvalue())
             
         except Exception as e:
             traceback.print_exc()
             self.send_response(500)
-            self._set_cors_headers()
+            self._cors()
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({'error': str(e)}).encode())
 
-    def _process_content(self, doc, content):
-        """Обрабатывает контент сообщения"""
+    def _process(self, doc, content):
         lines = content.split('\n')
         i = 0
-        
         while i < len(lines):
             line = lines[i]
             
-            # --- Изображения ---
-            img_match = re.search(r'!\[([^\]]*)\]\(([^\)]+)\)', line)
-            if img_match:
-                self._add_image(doc, img_match.group(2), img_match.group(1))
+            img = re.search(r'!\[([^\]]*)\]\(([^\)]+)\)', line)
+            if img:
+                self._img(doc, img.group(2), img.group(1))
                 i += 1
                 continue
             
-            # --- Блоки кода ---
             if line.strip().startswith('```'):
-                code_lines = []
+                code = []
                 i += 1
                 while i < len(lines) and not lines[i].strip().startswith('```'):
-                    code_lines.append(lines[i])
+                    code.append(lines[i])
                     i += 1
-                self._add_code_block(doc, '\n'.join(code_lines))
+                self._code(doc, '\n'.join(code))
                 i += 1
                 continue
             
-            # --- Таблицы ---
             if '|' in line and line.strip().startswith('|'):
-                table_lines = []
+                tlines = []
                 while i < len(lines) and '|' in lines[i]:
                     if '---' not in lines[i]:
-                        table_lines.append(lines[i])
+                        tlines.append(lines[i])
                     i += 1
-                if table_lines:
-                    self._add_table(doc, table_lines)
+                if tlines:
+                    self._table(doc, tlines)
                 continue
             
-            # --- Блочная формула $$...$$ на одной строке ---
-            block_match = re.match(r'^\s*\$\$(.+?)\$\$\s*$', line)
-            if block_match:
-                latex = block_match.group(1).strip()
-                para = doc.add_paragraph()
-                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                add_math_to_paragraph(para, latex)
+            bm = re.match(r'^\s*\$\$(.+?)\$\$\s*$', line)
+            if bm:
+                add_block_formula(doc, bm.group(1).strip())
                 i += 1
                 continue
             
-            # --- Блочная формула $$\n...\n$$ многострочная ---
             if line.strip() == '$$':
-                formula_lines = []
+                fl = []
                 i += 1
                 while i < len(lines) and lines[i].strip() != '$$':
-                    formula_lines.append(lines[i])
+                    fl.append(lines[i])
                     i += 1
-                latex = ' '.join(formula_lines).strip()
+                latex = ' '.join(fl).strip()
                 if latex:
-                    para = doc.add_paragraph()
-                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    add_math_to_paragraph(para, latex)
+                    add_block_formula(doc, latex)
                 i += 1
                 continue
             
-            # --- Обычный текст (может содержать inline $...$) ---
             if line.strip():
-                self._add_text_with_math(doc, line)
+                self._text_math(doc, line)
             else:
                 doc.add_paragraph()
-            
             i += 1
 
-    def _add_text_with_math(self, doc, text):
-        """Текст с inline формулами $...$"""
-        # Разбиваем по $...$ (но не $$)
+    def _text_math(self, doc, text):
         parts = re.split(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', text)
-        
-        if len(parts) == 1:
-            # Нет формул — просто текст
-            para = doc.add_paragraph()
-            self._add_formatted_run(para, text)
+        if len(parts) <= 1:
+            p = doc.add_paragraph()
+            self._fmt(p, text)
             return
-        
-        para = doc.add_paragraph()
+        p = doc.add_paragraph()
         for idx, part in enumerate(parts):
             if idx % 2 == 0:
-                # Обычный текст
                 if part:
-                    self._add_formatted_run(para, part)
+                    self._fmt(p, part)
             else:
-                # Inline формула
-                add_math_to_paragraph(para, part.strip())
+                insert_math(p, part.strip())
 
-    def _add_formatted_run(self, para, text):
-        """Текст с **жирным** и *курсивом*"""
-        # Сначала жирный
-        bold_parts = re.split(r'\*\*(.+?)\*\*', text)
-        for i, part in enumerate(bold_parts):
+    def _fmt(self, para, text):
+        bparts = re.split(r'\*\*(.+?)\*\*', text)
+        for i, bp in enumerate(bparts):
             if i % 2 == 0:
-                # Проверяем курсив
-                italic_parts = re.split(r'\*(.+?)\*', part)
-                for j, ipart in enumerate(italic_parts):
+                iparts = re.split(r'\*(.+?)\*', bp)
+                for j, ip in enumerate(iparts):
                     if j % 2 == 0:
-                        if ipart:
-                            para.add_run(ipart)
+                        if ip: para.add_run(ip)
                     else:
-                        run = para.add_run(ipart)
-                        run.italic = True
+                        r = para.add_run(ip)
+                        r.italic = True
             else:
-                run = para.add_run(part)
-                run.bold = True
+                r = para.add_run(bp)
+                r.bold = True
 
-    def _add_code_block(self, doc, code):
-        """Блок кода с серым фоном"""
-        para = doc.add_paragraph()
-        run = para.add_run(code)
-        run.font.name = 'Courier New'
-        run.font.size = Pt(10)
-        shading = OxmlElement('w:shd')
-        shading.set(qn('w:fill'), 'F5F5F5')
-        para._element.get_or_add_pPr().append(shading)
+    def _code(self, doc, code):
+        p = doc.add_paragraph()
+        r = p.add_run(code)
+        r.font.name = 'Courier New'
+        r.font.size = Pt(10)
+        s = OxmlElement('w:shd')
+        s.set(qn('w:fill'), 'F5F5F5')
+        p._element.get_or_add_pPr().append(s)
 
-    def _add_image(self, doc, src, alt=''):
-        """Изображение"""
+    def _img(self, doc, src, alt=''):
         try:
+            import urllib.request, base64
             if src.startswith('data:image'):
-                import base64
                 b64 = src.split('base64,')[1]
-                img_bytes = base64.b64decode(b64)
-                stream = io.BytesIO(img_bytes)
+                stream = io.BytesIO(base64.b64decode(b64))
             else:
                 req = urllib.request.Request(src, headers={'User-Agent': 'Mozilla/5.0'})
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    img_bytes = resp.read()
-                stream = io.BytesIO(img_bytes)
-            
-            para = doc.add_paragraph()
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = para.add_run()
-            run.add_picture(stream, width=Inches(5.0))
-            
-            if alt and alt != 'Image':
-                cap = doc.add_paragraph()
-                cap_run = cap.add_run(alt)
-                cap_run.italic = True
-                cap_run.font.size = Pt(10)
-                cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    stream = io.BytesIO(resp.read())
+            p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.add_run().add_picture(stream, width=Inches(5.0))
         except:
-            para = doc.add_paragraph()
-            run = para.add_run(f'[Image: {alt}]')
-            run.italic = True
-            run.font.color.rgb = RGBColor(150, 150, 150)
+            p = doc.add_paragraph()
+            r = p.add_run(f'[Image: {alt}]')
+            r.italic = True
 
-    def _add_table(self, doc, table_lines):
-        """Markdown таблица"""
+    def _table(self, doc, tlines):
         rows = []
-        for line in table_lines:
-            cells = [c.strip() for c in line.split('|') if c.strip()]
-            if cells:
-                rows.append(cells)
-        if not rows:
-            return
-        max_cols = max(len(r) for r in rows)
-        table = doc.add_table(rows=len(rows), cols=max_cols)
-        table.style = 'Table Grid'
-        for i, row_data in enumerate(rows):
-            for j, cell_text in enumerate(row_data):
-                if j < max_cols:
-                    cell = table.rows[i].cells[j]
-                    run = cell.paragraphs[0].add_run(cell_text)
-                    run.font.size = Pt(11)
-                    if i == 0:
-                        run.bold = True
+        for l in tlines:
+            cells = [c.strip() for c in l.split('|') if c.strip()]
+            if cells: rows.append(cells)
+        if not rows: return
+        mc = max(len(r) for r in rows)
+        t = doc.add_table(rows=len(rows), cols=mc)
+        t.style = 'Table Grid'
+        for i, rd in enumerate(rows):
+            for j, ct in enumerate(rd):
+                if j < mc:
+                    r = t.rows[i].cells[j].paragraphs[0].add_run(ct)
+                    r.font.size = Pt(11)
+                    if i == 0: r.bold = True
 
-    def _get_date(self):
+    def _date(self):
         from datetime import datetime
         return datetime.now().strftime('%d.%m.%Y %H:%M')
