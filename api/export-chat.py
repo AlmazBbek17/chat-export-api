@@ -2,82 +2,94 @@ from http.server import BaseHTTPRequestHandler
 import json
 import io
 import re
+import traceback
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+from docx.oxml.ns import qn, nsmap
 from lxml import etree
 import urllib.request
 
 # =============================================
-# XSLT для конвертации MathML → OMML (Word Math)
+# LaTeX → OMML (нативные формулы Word)
 # =============================================
-MATHML_TO_OMML_XSLT = None
 
-def get_omml_xslt():
-    """Загружает и кеширует XSLT трансформацию MathML→OMML"""
-    global MATHML_TO_OMML_XSLT
-    if MATHML_TO_OMML_XSLT is not None:
-        return MATHML_TO_OMML_XSLT
+# Word namespace для математики
+WORD_MATH_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/math'
+
+# Кешируем XSLT
+_XSLT_TRANSFORM = None
+
+def get_xslt_transform():
+    """Загружает и кеширует XSLT для MathML→OMML"""
+    global _XSLT_TRANSFORM
+    if _XSLT_TRANSFORM is not None:
+        return _XSLT_TRANSFORM
     
-    try:
-        # Используем встроенный XSLT из python-docx или создаём свой
-        import importlib.resources
-        # Пробуем найти MML2OMML.XSL
-        xslt_path = None
-        
-        # Вариант: скачиваем XSLT с GitHub
-        xslt_url = 'https://raw.githubusercontent.com/nicjohnson145/planern/master/planern/MML2OMML.XSL'
-        req = urllib.request.Request(xslt_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            xslt_content = response.read()
-        
-        xslt_tree = etree.fromstring(xslt_content)
-        MATHML_TO_OMML_XSLT = etree.XSLT(xslt_tree)
-        return MATHML_TO_OMML_XSLT
-    except Exception as e:
-        print(f'Failed to load XSLT: {e}')
-        return None
+    # Список зеркал для скачивания MML2OMML.XSL
+    xslt_urls = [
+        'https://raw.githubusercontent.com/nicjohnson145/planern/master/planern/MML2OMML.XSL',
+        'https://raw.githubusercontent.com/oerpub/mathconverter/master/MML2OMML.XSL',
+        'https://raw.githubusercontent.com/pjheslin/diogenes/master/server/MML2OMML.XSL',
+    ]
+    
+    for url in xslt_urls:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as response:
+                xslt_content = response.read()
+            xslt_tree = etree.fromstring(xslt_content)
+            _XSLT_TRANSFORM = etree.XSLT(xslt_tree)
+            print(f'XSLT loaded successfully from {url}')
+            return _XSLT_TRANSFORM
+        except Exception as e:
+            print(f'Failed to load XSLT from {url}: {e}')
+            continue
+    
+    print('All XSLT sources failed')
+    return None
 
 
 def latex_to_omml(latex_str):
-    """Конвертирует LaTeX → MathML → OMML (нативный Word формат)"""
+    """LaTeX → MathML → OMML"""
     try:
         from latex2mathml.converter import convert as latex_to_mathml
         
-        # Шаг 1: LaTeX → MathML
+        # LaTeX → MathML
         mathml_str = latex_to_mathml(latex_str)
         
-        # Шаг 2: MathML → OMML через XSLT
-        xslt = get_omml_xslt()
+        # MathML → OMML
+        xslt = get_xslt_transform()
         if xslt is None:
             return None
         
-        # Парсим MathML
         mathml_tree = etree.fromstring(mathml_str.encode('utf-8'))
-        
-        # Применяем XSLT трансформацию
         omml_tree = xslt(mathml_tree)
-        
-        # Получаем корневой элемент OMML
         omml_root = omml_tree.getroot()
         
         return omml_root
     except Exception as e:
-        print(f'LaTeX to OMML conversion failed for "{latex_str}": {e}')
+        print(f'LaTeX→OMML failed for "{latex_str}": {e}')
         return None
 
 
-def add_omml_to_paragraph(paragraph, omml_element):
-    """Вставляет OMML элемент в параграф Word"""
-    try:
-        # oMath должен быть дочерним элементом параграфа
-        paragraph._element.append(omml_element)
-        return True
-    except Exception as e:
-        print(f'Failed to add OMML to paragraph: {e}')
-        return False
+def add_math_to_paragraph(para, latex_str):
+    """Добавляет формулу в параграф. Возвращает True если успешно."""
+    omml = latex_to_omml(latex_str)
+    if omml is not None:
+        try:
+            para._element.append(omml)
+            return True
+        except:
+            pass
+    
+    # Fallback: красивый текст формулы
+    run = para.add_run(latex_str)
+    run.font.name = 'Cambria Math'
+    run.font.size = Pt(12)
+    run.italic = True
+    return False
 
 
 class handler(BaseHTTPRequestHandler):
@@ -98,10 +110,19 @@ class handler(BaseHTTPRequestHandler):
         self._set_cors_headers()
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
+        
+        # Тестируем конвертацию при GET запросе
+        test_result = 'not tested'
+        try:
+            omml = latex_to_omml(r'\frac{a}{b}')
+            test_result = 'OK' if omml is not None else 'XSLT failed'
+        except Exception as e:
+            test_result = f'Error: {str(e)}'
+        
         response = json.dumps({
             'status': 'OK',
-            'message': 'Gemini Chat Export API with OMML math support',
-            'version': '2.0'
+            'message': 'Gemini Chat Export API v2 - OMML Math',
+            'math_test': test_result
         })
         self.wfile.write(response.encode())
 
@@ -119,49 +140,41 @@ class handler(BaseHTTPRequestHandler):
                 self._set_cors_headers()
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
-                error = json.dumps({'error': 'No messages provided'})
-                self.wfile.write(error.encode())
+                self.wfile.write(json.dumps({'error': 'No messages'}).encode())
                 return
             
-            # Создаём документ
             doc = Document()
             
             # Заголовок
             heading = doc.add_heading(title, level=1)
             heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
             
-            # Дата
             date_para = doc.add_paragraph()
-            date_run = date_para.add_run(self.get_current_date())
+            date_run = date_para.add_run(self._get_date())
             date_run.font.size = Pt(10)
             date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            
             doc.add_paragraph()
             
-            # Обрабатываем сообщения
-            for i, message in enumerate(messages):
-                role = message.get('role', 'user')
-                content = message.get('content', '')
+            for i, msg in enumerate(messages):
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')
                 
-                role_name = 'You' if role == 'user' else 'Gemini'
+                # Роль
                 role_para = doc.add_paragraph()
-                role_run = role_para.add_run(role_name)
+                role_run = role_para.add_run('You' if role == 'user' else 'Gemini')
                 role_run.bold = True
                 role_run.font.size = Pt(14)
+                role_run.font.color.rgb = RGBColor(33, 150, 243) if role == 'user' else RGBColor(76, 175, 80)
                 
-                if role == 'user':
-                    role_run.font.color.rgb = RGBColor(33, 150, 243)
-                else:
-                    role_run.font.color.rgb = RGBColor(76, 175, 80)
+                # Контент
+                self._process_content(doc, content)
                 
-                self.process_content(doc, content)
-                
+                # Разделитель
                 if i < len(messages) - 1:
-                    separator = doc.add_paragraph()
-                    sep_run = separator.add_run('─' * 60)
+                    sep = doc.add_paragraph()
+                    sep_run = sep.add_run('─' * 60)
                     sep_run.font.color.rgb = RGBColor(200, 200, 200)
             
-            # Сохраняем
             buffer = io.BytesIO()
             doc.save(buffer)
             buffer.seek(0)
@@ -169,161 +182,117 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self._set_cors_headers()
             self.send_header('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-            self.send_header('Content-Disposition', f'attachment; filename="{title}.docx"')
+            self.send_header('Content-Disposition', f'attachment; filename="gemini-chat.docx"')
             self.end_headers()
             self.wfile.write(buffer.getvalue())
             
         except Exception as e:
-            import traceback
             traceback.print_exc()
             self.send_response(500)
             self._set_cors_headers()
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            error_response = json.dumps({'error': str(e)})
-            self.wfile.write(error_response.encode())
+            self.wfile.write(json.dumps({'error': str(e)}).encode())
 
-    def process_content(self, doc, content):
-        """Обрабатывает контент с формулами, кодом, таблицами и изображениями"""
+    def _process_content(self, doc, content):
+        """Обрабатывает контент сообщения"""
         lines = content.split('\n')
-        
         i = 0
+        
         while i < len(lines):
             line = lines[i]
             
-            # Изображения
-            image_pattern = r'!\[([^\]]*)\]\(([^\)]+)\)'
-            if re.search(image_pattern, line):
-                match = re.search(image_pattern, line)
-                if match:
-                    alt_text = match.group(1)
-                    image_data = match.group(2)
-                    try:
-                        if image_data.startswith('data:image'):
-                            self.add_image_from_base64(doc, image_data, alt_text)
-                        else:
-                            self.add_image_from_url(doc, image_data, alt_text)
-                    except Exception as e:
-                        para = doc.add_paragraph()
-                        run = para.add_run(f'[Image: {alt_text}]')
-                        run.italic = True
-                    i += 1
-                    continue
+            # --- Изображения ---
+            img_match = re.search(r'!\[([^\]]*)\]\(([^\)]+)\)', line)
+            if img_match:
+                self._add_image(doc, img_match.group(2), img_match.group(1))
+                i += 1
+                continue
             
-            # Блоки кода
+            # --- Блоки кода ---
             if line.strip().startswith('```'):
                 code_lines = []
                 i += 1
                 while i < len(lines) and not lines[i].strip().startswith('```'):
                     code_lines.append(lines[i])
                     i += 1
-                
-                code_para = doc.add_paragraph()
-                code_run = code_para.add_run('\n'.join(code_lines))
-                code_run.font.name = 'Courier New'
-                code_run.font.size = Pt(10)
-                
-                shading = OxmlElement('w:shd')
-                shading.set(qn('w:fill'), 'F5F5F5')
-                code_para._element.get_or_add_pPr().append(shading)
-                
+                self._add_code_block(doc, '\n'.join(code_lines))
                 i += 1
                 continue
             
-            # Таблицы
+            # --- Таблицы ---
             if '|' in line and line.strip().startswith('|'):
                 table_lines = []
                 while i < len(lines) and '|' in lines[i]:
                     if '---' not in lines[i]:
                         table_lines.append(lines[i])
                     i += 1
-                
                 if table_lines:
-                    self.add_markdown_table(doc, table_lines)
+                    self._add_table(doc, table_lines)
                 continue
             
-            # =============================================
-            # БЛОЧНЫЕ ФОРМУЛЫ: $$...$$
-            # =============================================
+            # --- Блочная формула $$...$$ на одной строке ---
             block_match = re.match(r'^\s*\$\$(.+?)\$\$\s*$', line)
             if block_match:
                 latex = block_match.group(1).strip()
-                self.add_block_math(doc, latex)
+                para = doc.add_paragraph()
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                add_math_to_paragraph(para, latex)
                 i += 1
                 continue
             
-            # Многострочная блочная формула: $$ на отдельной строке
+            # --- Блочная формула $$\n...\n$$ многострочная ---
             if line.strip() == '$$':
                 formula_lines = []
                 i += 1
                 while i < len(lines) and lines[i].strip() != '$$':
                     formula_lines.append(lines[i])
                     i += 1
-                latex = '\n'.join(formula_lines).strip()
+                latex = ' '.join(formula_lines).strip()
                 if latex:
-                    self.add_block_math(doc, latex)
+                    para = doc.add_paragraph()
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    add_math_to_paragraph(para, latex)
                 i += 1
                 continue
             
-            # Обычный текст с inline формулами $...$
+            # --- Обычный текст (может содержать inline $...$) ---
             if line.strip():
-                self.add_text_with_inline_math(doc, line)
+                self._add_text_with_math(doc, line)
             else:
                 doc.add_paragraph()
             
             i += 1
 
-    def add_block_math(self, doc, latex):
-        """Добавляет блочную формулу как нативную формулу Word"""
-        para = doc.add_paragraph()
-        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        omml = latex_to_omml(latex)
-        if omml is not None:
-            add_omml_to_paragraph(para, omml)
-        else:
-            # Fallback: добавляем как стилизованный текст
-            run = para.add_run(latex)
-            run.font.name = 'Cambria Math'
-            run.font.size = Pt(12)
-            run.italic = True
-
-    def add_text_with_inline_math(self, doc, text):
-        """Добавляет текст с inline LaTeX формулами как нативными формулами Word"""
-        # Разделяем текст на части: обычный текст и формулы
-        # Паттерн: $...$ но НЕ $$...$$
+    def _add_text_with_math(self, doc, text):
+        """Текст с inline формулами $...$"""
+        # Разбиваем по $...$ (но не $$)
         parts = re.split(r'(?<!\$)\$(?!\$)(.+?)(?<!\$)\$(?!\$)', text)
         
-        para = doc.add_paragraph()
+        if len(parts) == 1:
+            # Нет формул — просто текст
+            para = doc.add_paragraph()
+            self._add_formatted_run(para, text)
+            return
         
+        para = doc.add_paragraph()
         for idx, part in enumerate(parts):
             if idx % 2 == 0:
                 # Обычный текст
                 if part:
-                    self.add_formatted_text(para, part)
+                    self._add_formatted_run(para, part)
             else:
                 # Inline формула
-                latex = part.strip()
-                omml = latex_to_omml(latex)
-                if omml is not None:
-                    add_omml_to_paragraph(para, omml)
-                else:
-                    # Fallback
-                    run = para.add_run(latex)
-                    run.font.name = 'Cambria Math'
-                    run.italic = True
+                add_math_to_paragraph(para, part.strip())
 
-    def add_formatted_text(self, para, text):
-        """Добавляет текст с форматированием (жирный, курсив)"""
-        # Жирный **text**
-        bold_pattern = r'\*\*(.+?)\*\*'
-        parts = re.split(bold_pattern, text)
-        
-        for i, part in enumerate(parts):
+    def _add_formatted_run(self, para, text):
+        """Текст с **жирным** и *курсивом*"""
+        # Сначала жирный
+        bold_parts = re.split(r'\*\*(.+?)\*\*', text)
+        for i, part in enumerate(bold_parts):
             if i % 2 == 0:
-                # Проверяем курсив *text*
-                italic_pattern = r'\*(.+?)\*'
-                italic_parts = re.split(italic_pattern, part)
+                # Проверяем курсив
+                italic_parts = re.split(r'\*(.+?)\*', part)
                 for j, ipart in enumerate(italic_parts):
                     if j % 2 == 0:
                         if ipart:
@@ -335,82 +304,68 @@ class handler(BaseHTTPRequestHandler):
                 run = para.add_run(part)
                 run.bold = True
 
-    def add_image_from_base64(self, doc, base64_data, alt_text=''):
+    def _add_code_block(self, doc, code):
+        """Блок кода с серым фоном"""
+        para = doc.add_paragraph()
+        run = para.add_run(code)
+        run.font.name = 'Courier New'
+        run.font.size = Pt(10)
+        shading = OxmlElement('w:shd')
+        shading.set(qn('w:fill'), 'F5F5F5')
+        para._element.get_or_add_pPr().append(shading)
+
+    def _add_image(self, doc, src, alt=''):
+        """Изображение"""
         try:
-            import base64
-            if 'base64,' in base64_data:
-                base64_data = base64_data.split('base64,')[1]
-            image_bytes = base64.b64decode(base64_data)
-            image_stream = io.BytesIO(image_bytes)
+            if src.startswith('data:image'):
+                import base64
+                b64 = src.split('base64,')[1]
+                img_bytes = base64.b64decode(b64)
+                stream = io.BytesIO(img_bytes)
+            else:
+                req = urllib.request.Request(src, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    img_bytes = resp.read()
+                stream = io.BytesIO(img_bytes)
+            
             para = doc.add_paragraph()
             para.alignment = WD_ALIGN_PARAGRAPH.CENTER
             run = para.add_run()
-            run.add_picture(image_stream, width=Inches(5.0))
-            if alt_text and alt_text != 'Image':
-                caption_para = doc.add_paragraph()
-                caption_run = caption_para.add_run(alt_text)
-                caption_run.italic = True
-                caption_run.font.size = Pt(10)
-                caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        except Exception as e:
+            run.add_picture(stream, width=Inches(5.0))
+            
+            if alt and alt != 'Image':
+                cap = doc.add_paragraph()
+                cap_run = cap.add_run(alt)
+                cap_run.italic = True
+                cap_run.font.size = Pt(10)
+                cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        except:
             para = doc.add_paragraph()
-            run = para.add_run(f'[Failed to load image: {alt_text}]')
+            run = para.add_run(f'[Image: {alt}]')
             run.italic = True
             run.font.color.rgb = RGBColor(150, 150, 150)
 
-    def add_image_from_url(self, doc, url, alt_text=''):
-        try:
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=30) as response:
-                image_data = response.read()
-            if len(image_data) < 100:
-                raise Exception('Image too small')
-            image_stream = io.BytesIO(image_data)
-            para = doc.add_paragraph()
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = para.add_run()
-            run.add_picture(image_stream, width=Inches(5.0))
-            if alt_text and alt_text != 'Image':
-                caption_para = doc.add_paragraph()
-                caption_run = caption_para.add_run(alt_text)
-                caption_run.italic = True
-                caption_run.font.size = Pt(10)
-                caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        except Exception as e:
-            para = doc.add_paragraph()
-            run = para.add_run(f'[Failed to load image]')
-            run.italic = True
-            run.font.color.rgb = RGBColor(150, 150, 150)
-            link_para = doc.add_paragraph()
-            link_run = link_para.add_run(f'Link: {url}')
-            link_run.font.size = Pt(9)
-            link_run.font.color.rgb = RGBColor(0, 0, 255)
-
-    def add_markdown_table(self, doc, table_lines):
-        if not table_lines:
-            return
+    def _add_table(self, doc, table_lines):
+        """Markdown таблица"""
         rows = []
         for line in table_lines:
-            cells = [cell.strip() for cell in line.split('|') if cell.strip()]
+            cells = [c.strip() for c in line.split('|') if c.strip()]
             if cells:
                 rows.append(cells)
         if not rows:
             return
-        
-        max_cols = max(len(row) for row in rows)
+        max_cols = max(len(r) for r in rows)
         table = doc.add_table(rows=len(rows), cols=max_cols)
         table.style = 'Table Grid'
-        
         for i, row_data in enumerate(rows):
             for j, cell_text in enumerate(row_data):
                 if j < max_cols:
                     cell = table.rows[i].cells[j]
-                    para = cell.paragraphs[0]
-                    run = para.add_run(cell_text)
+                    run = cell.paragraphs[0].add_run(cell_text)
                     run.font.size = Pt(11)
                     if i == 0:
                         run.bold = True
 
-    def get_current_date(self):
+    def _get_date(self):
         from datetime import datetime
         return datetime.now().strftime('%d.%m.%Y %H:%M')
