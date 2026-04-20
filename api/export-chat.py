@@ -572,7 +572,6 @@ class handler(BaseHTTPRequestHandler):
             
             messages = data.get('messages', [])
             title = data.get('title', 'Gemini Chat')
-            hide_roles = data.get('hideRoles', False)
             
             if not messages:
                 self.send_response(400)
@@ -596,7 +595,6 @@ class handler(BaseHTTPRequestHandler):
                 role = msg.get('role', 'user')
                 content = msg.get('content', '')
                 
-                           if not hide_roles:
                 rp = doc.add_paragraph()
                 rr = rp.add_run('You' if role == 'user' else 'Gemini')
                 rr.bold = True
